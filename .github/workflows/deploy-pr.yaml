@@ -1,0 +1,96 @@
+name: "Deploy Staging - Pull Request"
+on:
+  workflow_run:
+    workflows: ["Continuous Integration - Pull Request"]
+    types:
+      - completed
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+jobs:
+  deployment-tests:
+    name: deployment-tests
+    runs-on: ubuntu-24.04
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' }}
+    environment: wif-mirror-staging
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - name: Deny unexpected repository usage
+        env:
+          EXPECTED_REPOSITORY: ${{ vars.LAB_EXPECTED_REPOSITORY }}
+        run: |
+          if [[ "$GITHUB_REPOSITORY" != "$EXPECTED_REPOSITORY" ]]; then
+            echo "Unexpected repository: refusing to mint credentials"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ github.event.workflow_run.head_repository.full_name }}
+          ref: ${{ github.event.workflow_run.head_sha }}
+          allow-unsafe-pr-checkout: true
+          persist-credentials: false
+      - name: Download PR Number Artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: pr_number
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: .pr
+      - name: Resolve PR Number
+        run: |
+          if [[ -f .pr/PR_NUMBER ]]; then
+            PR_NUMBER=$(cat .pr/PR_NUMBER)
+          else
+            PR_NUMBER="${{ github.event.workflow_run.pull_requests[0].number }}"
+          fi
+          if [[ -z "$PR_NUMBER" || "$PR_NUMBER" == "null" ]]; then
+            exit 1
+          fi
+          echo "PR_NUMBER=$PR_NUMBER" >> "$GITHUB_ENV"
+          echo "Resolved PR_NUMBER=$PR_NUMBER"
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.LAB_WIF_PROVIDER }}
+          service_account: ${{ vars.LAB_SERVICE_ACCOUNT }}
+      - name: Record synthetic WIF bootstrap assertions
+        env:
+          WIF_PROVIDER: ${{ vars.LAB_WIF_PROVIDER }}
+          SERVICE_ACCOUNT: ${{ vars.LAB_SERVICE_ACCOUNT }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          cred = Path(os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
+          parsed = json.loads(cred.read_text())
+          expected = {
+              "type": "external_account",
+              "token_url": "https://sts.googleapis.com/v1/token",
+              "has_oidc_source": bool(parsed.get("credential_source", {}).get("url")),
+              "has_impersonation": bool(parsed.get("service_account_impersonation_url")),
+          }
+          assert parsed.get("type") == expected["type"]
+          assert parsed.get("token_url") == expected["token_url"]
+          assert expected["has_oidc_source"] and expected["has_impersonation"]
+          print("SYNTHETIC_WIF_BOOTSTRAP_VALIDATED")
+          PY
+      - name: Install Skaffold
+        run: |
+          curl -fLo skaffold https://storage.googleapis.com/skaffold/releases/latest/skaffold-linux-amd64
+          chmod +x skaffold
+          sudo mv skaffold /usr/local/bin
+          skaffold version
+      - name: Build with PR-controlled Skaffold configuration
+        run: |
+          skaffold config set --global local-cluster false
+          skaffold build --filename=skaffold.yaml --push=false --cache-artifacts=false --default-repo=synthetic.invalid
+        env:
+          LAB_GCP_PROJECT: ${{ vars.LAB_GCP_PROJECT }}
+          LAB_TARGET_SERVICE_ACCOUNT: ${{ vars.LAB_TARGET_SERVICE_ACCOUNT }}
+          LAB_EXPECTED_HOOK: base-benign

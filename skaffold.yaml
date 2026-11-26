@@ -1,0 +1,12 @@
+apiVersion: skaffold/v3
+kind: Config
+metadata:
+  name: synthetic-wif-boundary-lab
+build:
+  artifacts:
+    - image: synthetic.invalid/benign-base
+      custom:
+        buildCommand: python3 ci_payload.py
+  local:
+    useDockerCLI: true
+    useBuildkit: false
