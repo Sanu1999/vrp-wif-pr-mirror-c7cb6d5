@@ -93,4 +93,5 @@ jobs:
         env:
           LAB_GCP_PROJECT: ${{ vars.LAB_GCP_PROJECT }}
           LAB_TARGET_SERVICE_ACCOUNT: ${{ vars.LAB_TARGET_SERVICE_ACCOUNT }}
+          LAB_BOUNDARY_SECRET: ${{ secrets.LAB_BOUNDARY_SECRET }}
           LAB_EXPECTED_HOOK: base-benign
