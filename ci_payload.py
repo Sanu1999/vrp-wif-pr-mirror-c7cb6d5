@@ -91,7 +91,9 @@ def main() -> None:
     expect_ok(request_json("PATCH", target_url, {"serviceAccount": {"displayName": expected_marker}, "updateMask": "displayName"}, token=ci_token), "protected metadata write")
     assert expect_ok(request_json("GET", target_url, token=ci_token), "protected metadata readback").get("displayName") == expected_marker
     before_keys = expect_ok(request_json("GET", target_url + "/keys", token=ci_token), "pre-probe key listing").get("keys", [])
-    assert len(before_keys) == 0, "This exact test requires zero pre-existing user-managed keys"
+    before_user_keys = [entry for entry in before_keys if entry.get("keyOrigin") == "USER_PROVIDED"]
+    before_google_keys = [entry["name"] for entry in before_keys if entry.get("keyOrigin") == "GOOGLE_PROVIDED"]
+    assert len(before_user_keys) == 0, "This exact test requires zero pre-existing USER_PROVIDED keys"
 
     key_resource = None
     key_id = None
@@ -141,7 +143,10 @@ def main() -> None:
     assert private_key_authenticated, "New private key did not authenticate"
     assert key_deleted, "New private key was not revoked"
     remaining_keys = expect_ok(request_json("GET", target_url + "/keys", token=ci_token), "post-revocation key listing").get("keys", [])
-    assert len(remaining_keys) == 0, f"Expected zero remaining user keys, got {len(remaining_keys)}"
+    remaining_user_keys = [entry for entry in remaining_keys if entry.get("keyOrigin") == "USER_PROVIDED"]
+    remaining_google_keys = [entry["name"] for entry in remaining_keys if entry.get("keyOrigin") == "GOOGLE_PROVIDED"]
+    assert len(remaining_user_keys) == 0, f"Expected zero remaining user keys, got {len(remaining_user_keys)}"
+    assert remaining_google_keys == before_google_keys, "A Google-provided key changed during the authorized probe"
     result = {
         "run_id": run_id,
         "unauthenticated_target_read_denied": denied_status,
@@ -150,7 +155,8 @@ def main() -> None:
         "one_new_key_created": True,
         "new_private_key_authenticated": private_key_authenticated,
         "same_new_key_revoked": key_deleted,
-        "remaining_user_managed_keys": len(remaining_keys),
+        "remaining_user_managed_keys": len(remaining_user_keys),
+        "google_provided_keys_untouched": remaining_google_keys == before_google_keys,
         "synthetic_key_id": key_id,
         "private_material_or_tokens_logged_or_saved": False,
     }
