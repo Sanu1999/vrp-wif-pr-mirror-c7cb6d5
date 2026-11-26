@@ -40,16 +40,52 @@ def b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
-def exchange_service_account_jwt(assertion: str) -> None:
+def exchange_service_account_jwt(assertion: str) -> dict:
+    """Bounded readiness retry; no token/JWT/private material or raw error body is logged."""
     form = urlencode({"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion}).encode()
     request = Request("https://oauth2.googleapis.com/token", data=form, method="POST", headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"})
-    try:
-        with urlopen(request, timeout=60) as response:
-            body = json.loads(response.read())
-    except HTTPError as error:
-        raise RuntimeError(f"Private-key authentication returned status {error.code}") from None
-    if not isinstance(body.get("access_token"), str) or not body["access_token"]:
-        raise RuntimeError("Private-key authentication returned no access token")
+    diagnostics = []
+    last_error_class = "unknown"
+    for attempt, delay in enumerate([0, 5, 10, 20], start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            with urlopen(request, timeout=60) as response:
+                body = json.loads(response.read())
+            if not isinstance(body.get("access_token"), str) or not body["access_token"]:
+                raise RuntimeError("Private-key authentication returned no access token")
+            return {"attempts": attempt, "transient_errors": diagnostics}
+        except HTTPError as error:
+            status = error.code
+            raw = error.read()
+            try:
+                response_body = json.loads(raw)
+            except Exception:
+                response_body = {}
+            error_class = response_body.get("error") if isinstance(response_body, dict) else None
+            if not isinstance(error_class, str) or not error_class.replace("_", "").replace("-", "").isalnum():
+                error_class = "http_error"
+            description = response_body.get("error_description", "").lower() if isinstance(response_body, dict) else ""
+            if any(term in description for term in ["key id", "key not found", "not active", "unable to find"]):
+                reason_class = "key_readiness"
+            elif any(term in description for term in ["clock", "timeframe", "expired", "expires"]):
+                reason_class = "timeframe"
+            elif any(term in description for term in ["signature", "verify", "verification"]):
+                reason_class = "signature_verification"
+            elif "scope" in description:
+                reason_class = "scope"
+            elif "audience" in description:
+                reason_class = "audience"
+            else:
+                reason_class = "unclassified"
+            diagnostics.append({"status": status, "error_class": error_class, "reason_class": reason_class})
+            last_error_class = f"{error_class}/{reason_class}"
+            if status == 400 or status >= 500:
+                continue
+            raise RuntimeError(f"Private-key authentication denied with status {status} ({last_error_class})") from None
+        except json.JSONDecodeError:
+            raise RuntimeError("Private-key authentication returned a non-JSON response") from None
+    raise RuntimeError(f"Private-key authentication failed bounded retry ({last_error_class})")
 
 
 def get_ci_token(credential: dict) -> str:
@@ -130,7 +166,7 @@ def main() -> None:
             check=True,
         ).stdout
         assertion = f"{header}.{claims}.{b64url(signature)}"
-        exchange_service_account_jwt(assertion)
+        authentication_diagnostics = exchange_service_account_jwt(assertion)
         private_key_authenticated = True
     finally:
         if private_key_path and private_key_path.exists():
@@ -154,6 +190,7 @@ def main() -> None:
         "wif_and_ci_identity_accepted": True,
         "one_new_key_created": True,
         "new_private_key_authenticated": private_key_authenticated,
+        "oauth_authentication_diagnostics": authentication_diagnostics,
         "same_new_key_revoked": key_deleted,
         "remaining_user_managed_keys": len(remaining_user_keys),
         "google_provided_keys_untouched": remaining_google_keys == before_google_keys,
@@ -161,6 +198,8 @@ def main() -> None:
         "private_material_or_tokens_logged_or_saved": False,
     }
     Path(os.environ["RUNNER_TEMP"], "credential-persistence-result.json").write_text(json.dumps(result, indent=2) + "\n")
+    print("SYNTHETIC_OAUTH_AUTHENTICATION_CONFIRMED")
+    print("SYNTHETIC_OAUTH_DIAGNOSTICS=" + json.dumps(authentication_diagnostics, separators=(",", ":")))
     print("SYNTHETIC_PRIVATE_KEY_USED_AND_REVOKED")
     print("SYNTHETIC_ZERO_REMAINING_USER_KEYS")
 
